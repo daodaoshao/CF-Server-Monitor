@@ -940,8 +940,6 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
             siteOptions[field] = /^[1-9]\d*$/.test(String(settings[field] || '').trim())
               ? String(settings[field]).trim()
               : '';
-          } else if (field === 'github_user_login') {
-            siteOptions[field] = String(settings[field] || '').trim().slice(0, 64);
           } else if (field === 'theme_url') {
             siteOptions[field] = normalizedThemeUrl;
           } else {

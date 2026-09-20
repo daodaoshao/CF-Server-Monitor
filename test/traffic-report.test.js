@@ -9,6 +9,7 @@ import {
   getTrafficPeriodKeys,
   initializeMissingTrafficSnapshots,
   normalizeTrafficSnapshots,
+  splitNotificationPayload,
   updateTrafficSnapshots
 } from '../src/services/notification.js';
 
@@ -155,10 +156,10 @@ test('traffic report content explains missing previous-period baselines', () => 
   }
 });
 
-test('traffic report payloads split servers into batches of at most 50', () => {
-  const servers = Array.from({ length: 101 }, (_, index) => ({
+test('traffic report payloads do not split solely by server count', () => {
+  const servers = Array.from({ length: 51 }, (_, index) => ({
     id: `server-${index + 1}`,
-    name: `Server ${index + 1}`
+    name: `S${index + 1}`
   }));
   const rows = servers.map(item => ({
     server_id: item.id,
@@ -168,12 +169,21 @@ test('traffic report payloads split servers into batches of at most 50', () => {
 
   const reports = buildTrafficReportPayloads(servers, rows, '每日');
 
-  assert.equal(reports.length, 3);
-  assert.equal(reports[0].context.count, 50);
-  assert.equal(reports[1].context.count, 50);
-  assert.equal(reports[2].context.count, 1);
-  assert.equal(reports[0].context.event, '每日流量报告（1/3）');
-  assert.equal(reports[2].context.event, '每日流量报告（3/3）');
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].context.count, 51);
+});
+
+test('generic notification splitting measures the rendered notification', () => {
+  const settings = {
+    notification_template: '{{event}}\n{{message}}\n' + 'x'.repeat(120),
+    notification_timezone: 'UTC'
+  };
+  const message = Array.from({ length: 30 }, (_, index) => `${index}-${'y'.repeat(30)}`).join('\n');
+  const payloads = splitNotificationPayload(settings, message, { event: '节点离线告警' }, 500);
+
+  assert.ok(payloads.length > 1);
+  assert.ok(payloads.every(payload => payload.context.message === payload.msg));
+  assert.ok(payloads.every(payload => payload.context.event.includes('/')));
 });
 
 test('traffic report payloads also split before the message soft limit', () => {

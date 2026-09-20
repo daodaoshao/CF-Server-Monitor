@@ -1,5 +1,12 @@
 import { initDatabase, weeklyCleanup, getMetricsHistory, clearHistory } from './database/schema.js';
-import { checkOfflineNodes, checkExpiringServers, checkResourceAlerts, checkTrafficReports } from './services/notification.js';
+import {
+  checkOfflineNodes,
+  checkExpiringServers,
+  checkResourceAlerts,
+  checkTrafficReports,
+  createNotificationSnapshot,
+  dispatchNotificationTasks
+} from './services/notification.js';
 import { updateDatabase } from './database/updateDatabase.js';
 import { handleAdminAPI } from './handlers/admin.js';
 import { serveFrontend } from './handlers/frontend.js';
@@ -491,26 +498,45 @@ export default {
     const minute = now.getUTCMinutes();
     
     if (cron === '*/1 * * * *') {
-      // Traffic reports must still run during the Sunday table-rotation window.
-      await checkTrafficReports(env.DB, { scheduled: true, staggered: true, now: now.getTime() });
+      let notificationSettings;
       if (day === 0 && hour === 0 && minute < 5) {
         debug('[Cron] 每周日0:00-0:05表轮换期间，跳过离线节点检测');
+        notificationSettings = await loadSiteSettings(env.DB);
       } else {
+        const notificationSnapshot = await createNotificationSnapshot(env.DB, {
+          now: now.getTime(),
+          includeLatestMetrics: true
+        });
+        notificationSettings = notificationSnapshot.settings;
         debug('[Cron] 开始执行离线节点检测');
-        await checkOfflineNodes(env.DB);
+        await checkOfflineNodes(env.DB, { snapshot: notificationSnapshot });
         debug('[Cron] 离线节点检测完成');
         debug('[Cron] 开始执行资源负载告警检测');
-        await checkResourceAlerts(env);
+        await checkResourceAlerts(env, { snapshot: notificationSnapshot });
         debug('[Cron] 资源负载告警检测完成');
       }
+      const deliveryResult = await dispatchNotificationTasks(env.DB, notificationSettings, { now: now.getTime() });
+      debug(`[Cron] 通知投递完成: attempted=${deliveryResult.attempted}, sent=${deliveryResult.sent}, failed=${deliveryResult.failed}`);
     } else if (cron === '0 * * * *') {
+      const notificationSnapshot = await createNotificationSnapshot(env.DB, {
+        now: now.getTime(),
+        includeServers: false
+      });
+      debug('[Cron] 检查是否到达服务器到期检测时间');
+      await checkExpiringServers(env.DB, { scheduled: true, snapshot: notificationSnapshot });
+      debug('[Cron] 检查是否到达流量报告时间');
+      try {
+        await checkTrafficReports(env.DB, { scheduled: true, snapshot: notificationSnapshot });
+      } catch (error) {
+        console.error('[Cron] 流量报告任务生成失败:', error);
+      }
+      const deliveryResult = await dispatchNotificationTasks(env.DB, notificationSnapshot.settings, { now: now.getTime() });
+      debug(`[Cron] 通知投递完成: attempted=${deliveryResult.attempted}, sent=${deliveryResult.sent}, failed=${deliveryResult.failed}`);
       if (day === 0 && hour === 0) {
         debug('[Cron] 开始执行每周数据清理任务（表轮换）');
         await weeklyCleanup(env.DB);
         debug('[Cron] 每周数据清理任务完成');
       }
-      debug('[Cron] 检查是否到达服务器到期检测时间');
-      await checkExpiringServers(env.DB, { scheduled: true, now: now.getTime() });
     }else if(env.DEBUG == 1){
       if (cron === '0 0 * * 0') {
         debug('[Cron DEBUG] 开始执行每周数据清理任务（表轮换）');

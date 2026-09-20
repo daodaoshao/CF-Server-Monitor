@@ -758,7 +758,7 @@ export async function getLatestMetrics(db, serverId, server = null) {
   }
 }
 
-export async function getLatestMetricsForAllServers(db) {
+export async function getLatestMetricsForAllServers(db, providedServers = null) {
   const now = Date.now();
   const cacheInfo = getLatestMetricsCache();
   if (cacheInfo.cache && now - cacheInfo.time < cacheInfo.ttl) {
@@ -769,7 +769,9 @@ export async function getLatestMetricsForAllServers(db) {
   await ensureHistoryIndex(db);
 
   try {
-    const servers = await getAllServers(db);
+    const servers = Array.isArray(providedServers)
+      ? providedServers
+      : await getAllServers(db);
 
     const entries = await Promise.all(
       servers.map(s =>

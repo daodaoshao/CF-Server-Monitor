@@ -704,7 +704,7 @@
             <div class="inline-help-action">
               <span class="text-sm">
                 {{ settings.github_user_id
-                  ? `${settings.github_user_login ? `@${settings.github_user_login} · ` : ''}ID: ${settings.github_user_id}`
+                  ? `ID: ${settings.github_user_id}`
                   : trans.githubNotBound }}
               </span>
               <button type="button" class="btn btn-sm" :disabled="!canBindGithub || githubBindingLoading" @click="$emit('bind-github-account')">

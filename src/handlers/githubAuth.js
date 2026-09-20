@@ -193,19 +193,18 @@ export async function handleGithubOAuthCallback(request, env, settings) {
 
     const githubUserId = String(user.id);
     if (mode === 'bind') {
-      const githubUserLogin = String(user.login || '').trim().slice(0, 64);
       await env.DB.prepare(`
         INSERT INTO settings (key, value)
-        VALUES ('site_options', json_object('github_user_id', ?, 'github_user_login', ?))
+        VALUES ('site_options', json_object('github_user_id', ?))
         ON CONFLICT(key) DO UPDATE SET value = CASE
           WHEN json_valid(value) AND json_type(value) = 'object'
-          THEN json_set(value, '$.github_user_id', ?, '$.github_user_login', ?)
-          ELSE json_object('github_user_id', ?, 'github_user_login', ?)
+          THEN json_set(value, '$.github_user_id', ?)
+          ELSE json_object('github_user_id', ?)
         END
       `).bind(
-        githubUserId, githubUserLogin,
-        githubUserId, githubUserLogin,
-        githubUserId, githubUserLogin
+        githubUserId,
+        githubUserId,
+        githubUserId
       ).run();
       clearSiteSettingsCache();
       return redirectToAdmin(request, '', [clearStateCookie], { github_bound: '1' });

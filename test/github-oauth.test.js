@@ -15,7 +15,6 @@ const oauthSettings = {
   github_client_id: 'client-id',
   github_client_secret: 'client-secret',
   github_user_id: '12345',
-  github_user_login: 'octocat',
   jwt_secret: '0123456789abcdef0123456789abcdef'
 };
 
@@ -90,7 +89,7 @@ test('GitHub OAuth callback issues the existing auth cookie without a database l
 });
 
 test('binding stores the authenticated GitHub account with one D1 write and no D1 read', async () => {
-  const unboundSettings = { ...oauthSettings, github_user_id: '', github_user_login: '' };
+  const unboundSettings = { ...oauthSettings, github_user_id: '' };
   const startResponse = handleGithubOAuthStartApi(
     new Request('https://monitor.example/auth/github'),
     unboundSettings,
@@ -138,18 +137,14 @@ test('binding stores the authenticated GitHub account with one D1 write and no D
     assert.equal(response.headers.get('Location'), 'https://monitor.example/admin?github_bound=1');
     assert.equal(dbCalls.length, 1);
     assert.match(dbCalls[0].sql, /json_set/);
-    assert.deepEqual(dbCalls[0].params, [
-      '67890', 'bound-user',
-      '67890', 'bound-user',
-      '67890', 'bound-user'
-    ]);
+    assert.deepEqual(dbCalls[0].params, ['67890', '67890', '67890']);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
 test('binding callback rejects an expired admin session before calling GitHub or D1', async () => {
-  const unboundSettings = { ...oauthSettings, github_user_id: '', github_user_login: '' };
+  const unboundSettings = { ...oauthSettings, github_user_id: '' };
   const startResponse = handleGithubOAuthStartApi(
     new Request('https://monitor.example/auth/github'),
     unboundSettings,
@@ -183,8 +178,7 @@ test('new GitHub fields do not trigger a legacy settings query', async () => {
     'github_oauth_enabled',
     'github_client_id',
     'github_client_secret',
-    'github_user_id',
-    'github_user_login'
+    'github_user_id'
   ]);
   const siteOptions = Object.fromEntries(
     SITE_FIELDS.filter(field => !githubFields.has(field)).map(field => [field, ''])
