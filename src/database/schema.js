@@ -2,7 +2,12 @@ import { getAllServers, getLatestMetricsCache, setLatestMetricsCache, getMetrics
 import { saveSiteOptions, debug, getSettingByKey, normalizeLongHistoryPoints, DEFAULT_LONG_HISTORY_POINTS } from '../utils/settings.js';
 import { attachDiskMetricsObject, flattenDiskMetrics, isDisabledProbeMetric, normalizeProbeMetricRow } from '../utils/metrics.js';
 import { ensureServerOptimization, buildHistoryId, getServerHistoryInfo, getHistoryIdRange } from './indexOptimization.js';
-import { addHistoryColumns, ensureHistoryIndex, isHistoryOptimized } from './updateDatabase.js';
+import {
+  addHistoryColumns,
+  ensureHistoryIndex,
+  ensureNotificationDeliveryTable,
+  isHistoryOptimized
+} from './updateDatabase.js';
 import {
   buildSparseHistoryQuery,
   shouldUseSparseHistorySampling
@@ -128,6 +133,8 @@ export async function initDatabase(db) {
     }else{
       await ensureHistoryIndex(db);
     }
+
+    await ensureNotificationDeliveryTable(db);
 
     debug('✅ 数据库初始化完成');
     dbInitialized = true;

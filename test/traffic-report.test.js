@@ -5,6 +5,8 @@ import {
   buildTrafficReportContent,
   buildTrafficReportPayloads,
   calculateTrafficDelta,
+  dispatchNotificationTasks,
+  enqueueNotification,
   getDueTrafficReportTypes,
   getTrafficBaselineTargets,
   getTrafficPeriodKeys,
@@ -69,6 +71,68 @@ test('traffic initialization fills only missing baselines', async () => {
   assert.deepEqual(snapshots.daily, { time: 1, rx_bytes: 100, tx_bytes: 200 });
   assert.deepEqual(snapshots.weekly, { time: now / 1000, rx_bytes: 1_000, tx_bytes: 2_000 });
   assert.deepEqual(snapshots.monthly, { time: now / 1000, rx_bytes: 1_000, tx_bytes: 2_000 });
+});
+
+test('notification tasks recreate a deleted delivery table and retry', async () => {
+  let tableExists = false;
+  let createCount = 0;
+  const insertedKeys = [];
+  const db = {
+    prepare(sql) {
+      if (/CREATE TABLE IF NOT EXISTS notification_deliveries/.test(sql)) {
+        return { run: async () => {
+          tableExists = true;
+          createCount += 1;
+          return { success: true };
+        } };
+      }
+      if (/CREATE INDEX IF NOT EXISTS idx_notification_deliveries_status/.test(sql)) {
+        return { run: async () => ({ success: true }) };
+      }
+      if (/INSERT OR IGNORE INTO notification_deliveries/.test(sql)) {
+        return {
+          bind(businessKey) {
+            return { run: async () => {
+              if (!tableExists) throw new Error('no such table: notification_deliveries');
+              insertedKeys.push(businessKey);
+              return { meta: { changes: 1 } };
+            } };
+          }
+        };
+      }
+      if (/SELECT business_key, payload, status/.test(sql)) {
+        return {
+          bind() {
+            return { all: async () => {
+              if (!tableExists) throw new Error('no such table: notification_deliveries');
+              return { results: [] };
+            } };
+          }
+        };
+      }
+      assert.fail(`Unexpected SQL: ${sql}`);
+    }
+  };
+  const task = {
+    businessKey: 'test:delivery',
+    type: 'test',
+    period: '2026-09-20',
+    now: Date.UTC(2026, 8, 20),
+    msg: 'test',
+    context: { event: 'test' }
+  };
+
+  assert.equal(await enqueueNotification(db, {}, task), 1);
+  tableExists = false;
+  assert.equal(await enqueueNotification(db, {}, { ...task, businessKey: 'test:delivery:retry' }), 1);
+  tableExists = false;
+  assert.deepEqual(await dispatchNotificationTasks(db, {
+    tg_bot_token: 'token',
+    tg_chat_id: 'chat'
+  }), { attempted: 0, sent: 0, failed: 0 });
+
+  assert.equal(createCount, 3);
+  assert.deepEqual(insertedKeys, ['test:delivery:part:1', 'test:delivery:retry:part:1']);
 });
 
 test('cron can initialize a missing baseline in memory without an extra D1 write', async () => {

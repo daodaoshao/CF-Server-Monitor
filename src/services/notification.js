@@ -3,7 +3,7 @@ import {
   getLatestMetricsForAllServers,
   getTrafficBaselineMetric
 } from '../database/schema.js';
-import { updateDatabase } from '../database/updateDatabase.js';
+import { ensureNotificationDeliveryTable, updateDatabase } from '../database/updateDatabase.js';
 import { clearServersListCache, getAllServers } from '../utils/cache.js';
 import {
   DEFAULT_NOTIFICATION_TEMPLATE,
@@ -43,11 +43,14 @@ const NOTIFICATION_RETRY_DELAYS_MS = [
   5 * 60_000,
   10 * 60_000
 ];
-let notificationDeliveryTableReady = false;
-
 function isMissingColumnError(error) {
   const message = error?.message || String(error);
   return /no such column|has no column/i.test(message);
+}
+
+function isMissingNotificationDeliveryTableError(error) {
+  const message = error?.message || String(error);
+  return /no such table[^\n]*notification_deliveries/i.test(message);
 }
 
 async function saveTrafficSnapshots(db, snapshots, serverId) {
@@ -1029,35 +1032,8 @@ export function splitNotificationPayload(settings, msg, context = {}, limit = NO
   }));
 }
 
-async function ensureNotificationDeliveryTable(db) {
-  if (notificationDeliveryTableReady) return;
-  await db.prepare(`
-    CREATE TABLE IF NOT EXISTS notification_deliveries (
-      business_key TEXT PRIMARY KEY,
-      type TEXT NOT NULL,
-      period TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL,
-      failed_at INTEGER DEFAULT NULL,
-      sent_at INTEGER DEFAULT NULL,
-      last_error TEXT DEFAULT '',
-      attempt_count INTEGER NOT NULL DEFAULT 0,
-      next_attempt_at INTEGER NOT NULL DEFAULT 0,
-      lease_until INTEGER NOT NULL DEFAULT 0,
-      expires_at INTEGER NOT NULL
-    )
-  `).run();
-  await db.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_notification_deliveries_status
-    ON notification_deliveries(status, created_at)
-  `).run();
-  notificationDeliveryTableReady = true;
-}
-
 export async function enqueueNotification(db, settings, task) {
   if (!db || !task?.businessKey || !task?.type) return 0;
-  await ensureNotificationDeliveryTable(db);
   const now = Number(task.now || Date.now());
   const period = String(task.period || '');
   const payloads = splitNotificationPayload(settings, task.msg, task.context);
@@ -1065,18 +1041,26 @@ export async function enqueueNotification(db, settings, task) {
 
   for (let index = 0; index < payloads.length; index += 1) {
     const businessKey = `${task.businessKey}:part:${index + 1}`;
-    const result = await db.prepare(`
-      INSERT OR IGNORE INTO notification_deliveries
-        (business_key, type, period, payload, status, created_at, expires_at)
-      VALUES (?, ?, ?, ?, 'pending', ?, ?)
-    `).bind(
-      businessKey,
-      task.type,
-      period,
-      JSON.stringify(payloads[index]),
-      now,
-      Number(task.expiresAt || (now + NOTIFICATION_DELIVERY_RETENTION_MS))
-    ).run();
+    const insert = () => db.prepare(`
+        INSERT OR IGNORE INTO notification_deliveries
+          (business_key, type, period, payload, status, created_at, expires_at)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?)
+      `).bind(
+        businessKey,
+        task.type,
+        period,
+        JSON.stringify(payloads[index]),
+        now,
+        Number(task.expiresAt || (now + NOTIFICATION_DELIVERY_RETENTION_MS))
+      ).run();
+    let result;
+    try {
+      result = await insert();
+    } catch (error) {
+      if (!isMissingNotificationDeliveryTableError(error)) throw error;
+      await ensureNotificationDeliveryTable(db);
+      result = await insert();
+    }
     inserted += getD1Changes(result);
   }
   return inserted;
@@ -1084,16 +1068,24 @@ export async function enqueueNotification(db, settings, task) {
 
 export async function dispatchNotificationTasks(db, settings, options = {}) {
   if (!db || !hasNotificationTarget(settings)) return { attempted: 0, sent: 0, failed: 0 };
-  await ensureNotificationDeliveryTable(db);
   const now = Number(options.now || Date.now());
   const limit = Math.max(1, Math.min(50, Number(options.limit) || NOTIFICATION_RETRY_BATCH_SIZE));
-  const { results = [] } = await db.prepare(`
-    SELECT business_key, payload, status, attempt_count, next_attempt_at, lease_until
-    FROM notification_deliveries
-    WHERE status IN ('pending', 'failed', 'sending') AND expires_at > ?
-    ORDER BY created_at ASC
-    LIMIT ?
-  `).bind(now, limit).all();
+  const selectPending = () => db.prepare(`
+      SELECT business_key, payload, status, attempt_count, next_attempt_at, lease_until
+      FROM notification_deliveries
+      WHERE status IN ('pending', 'failed', 'sending') AND expires_at > ?
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).bind(now, limit).all();
+  let pendingResult;
+  try {
+    pendingResult = await selectPending();
+  } catch (error) {
+    if (!isMissingNotificationDeliveryTableError(error)) throw error;
+    await ensureNotificationDeliveryTable(db);
+    pendingResult = await selectPending();
+  }
+  const { results = [] } = pendingResult;
 
   let attempted = 0;
   let sent = 0;
