@@ -28,6 +28,9 @@ jobs:
           upstream_sync_branch: main
           target_sync_branch: main
           target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
+          # 本 fork 比上游多一个「固化部署配置」的提交，属于分叉状态；
+          # 默认的 --ff-only 会让每日同步失败，这里改成合并。
+          git_pull_args: --no-rebase
 
           # Set test_mode true to run tests instead of the true action!!
           test_mode: false
