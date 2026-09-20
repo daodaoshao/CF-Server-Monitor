@@ -5,6 +5,8 @@ import {
   buildTrafficReportContent,
   buildTrafficReportPayloads,
   calculateTrafficDelta,
+  checkTrafficReports,
+  collectMissingTrafficBaselineTypes,
   dispatchNotificationTasks,
   enqueueNotification,
   getDueTrafficReportTypes,
@@ -456,4 +458,144 @@ test('traffic report payloads also split before the message soft limit', () => {
 
   assert.ok(reports.length > 1);
   assert.ok(reports.every(report => report.msg.length <= 3000));
+});
+
+test('traffic snapshots flag every period without a usable baseline', () => {
+  const now = Date.UTC(2026, 8, 20, 2);
+  const first = updateTrafficSnapshots('{}', 10_000, 20_000, now, ['daily', 'weekly', 'monthly']);
+
+  assert.deepEqual(first.missing, ['daily', 'weekly', 'monthly']);
+  assert.deepEqual(first.usage.daily, { rx_bytes: 0, tx_bytes: 0 });
+
+  const samePeriod = updateTrafficSnapshots(
+    first.snapshots,
+    15_000,
+    28_000,
+    Date.UTC(2026, 8, 20, 4),
+    ['daily', 'weekly', 'monthly']
+  );
+  assert.deepEqual(samePeriod.missing, []);
+  assert.deepEqual(samePeriod.usage.daily, { rx_bytes: 5_000, tx_bytes: 8_000 });
+
+  const afterGap = updateTrafficSnapshots(first.snapshots, 25_000, 40_000, Date.UTC(2026, 8, 24, 2), ['daily']);
+  assert.deepEqual(afterGap.missing, ['daily']);
+  assert.deepEqual(afterGap.usage.daily, { rx_bytes: 0, tx_bytes: 0 });
+});
+
+test('traffic baseline detection only reports periods that are actually absent', () => {
+  const servers = [
+    { id: 'kept', traffic_snapshots: JSON.stringify({ daily: { time: 1, rx_bytes: 1, tx_bytes: 2 } }) },
+    { id: 'blank', traffic_snapshots: '{}' },
+    { id: 'broken', traffic_snapshots: 'invalid json' }
+  ];
+
+  const missing = collectMissingTrafficBaselineTypes(servers, ['daily', 'weekly']);
+
+  assert.deepEqual([...missing.get('kept')], ['weekly']);
+  assert.deepEqual([...missing.get('blank')], ['daily', 'weekly']);
+  assert.deepEqual([...missing.get('broken')], ['daily', 'weekly']);
+  assert.equal(missing.size, 3);
+});
+
+function createTrafficReportDb() {
+  const saved = [];
+  const inserted = [];
+  const db = {
+    prepare(sql) {
+      if (/INSERT INTO settings/.test(sql)) {
+        return { bind: () => ({ run: async () => ({ meta: { changes: 1 } }) }) };
+      }
+      if (/UPDATE servers SET traffic_snapshots/.test(sql)) {
+        return {
+          bind(value, id) {
+            return { run: async () => {
+              saved.push({ value, id });
+              return { success: true };
+            } };
+          }
+        };
+      }
+      if (/INSERT OR IGNORE INTO notification_deliveries/.test(sql)) {
+        return {
+          bind(...args) {
+            return { run: async () => {
+              inserted.push(args);
+              return { meta: { changes: 1 } };
+            } };
+          }
+        };
+      }
+      assert.fail(`Unexpected SQL: ${sql}`);
+    }
+  };
+  return { db, saved, inserted };
+}
+
+function trafficReportSettings() {
+  return {
+    traffic_report_enabled: 'true',
+    notification_timezone: timezone,
+    expire_notification_time: '10',
+    tg_bot_token: 'token',
+    tg_chat_id: 'chat'
+  };
+}
+
+test('cron traffic reports a wiped baseline as unavailable instead of 0 B', async () => {
+  const now = Date.UTC(2026, 8, 20, 2);
+  const servers = [{ id: server.id, name: server.name, traffic_snapshots: '{}' }];
+  const latestMetrics = new Map([[server.id, { net_rx: 5_000, net_tx: 8_000 }]]);
+  const { db, saved, inserted } = createTrafficReportDb();
+
+  const handled = await checkTrafficReports(db, {
+    snapshot: { settings: trafficReportSettings(), now, servers, latestMetrics }
+  });
+
+  assert.equal(handled, true);
+  assert.equal(inserted.length, 1);
+  assert.equal(inserted[0][0], 'traffic:daily:2026-09-20:batch:1:part:1');
+  assert.equal(inserted[0][1], 'traffic_daily');
+
+  const payload = JSON.parse(inserted[0][3]);
+  assert.match(payload.msg, /Tokyo/);
+  assert.match(payload.msg, /暂无昨日数据/);
+  assert.doesNotMatch(payload.msg, /0 B/);
+  assert.doesNotMatch(payload.msg, /总计/);
+
+  // The blank baseline is still rolled forward so the next period stays correct.
+  assert.deepEqual(JSON.parse(saved[0].value).daily, {
+    time: Math.floor(now / 1000),
+    rx_bytes: 5_000,
+    tx_bytes: 8_000
+  });
+});
+
+test('cron traffic reports a baseline from a non-adjacent period as unavailable', async () => {
+  const now = Date.UTC(2026, 8, 20, 2);
+  const staleTime = Math.floor(Date.UTC(2026, 8, 15, 2) / 1000);
+  const servers = [{
+    id: server.id,
+    name: server.name,
+    traffic_snapshots: JSON.stringify({
+      daily: { time: staleTime, rx_bytes: 1_000, tx_bytes: 2_000 }
+    })
+  }];
+  const latestMetrics = new Map([[server.id, { net_rx: 5_000, net_tx: 8_000 }]]);
+  const { db, saved, inserted } = createTrafficReportDb();
+
+  const handled = await checkTrafficReports(db, {
+    snapshot: { settings: trafficReportSettings(), now, servers, latestMetrics }
+  });
+
+  assert.equal(handled, true);
+  assert.equal(inserted.length, 1);
+
+  const payload = JSON.parse(inserted[0][3]);
+  assert.match(payload.msg, /暂无昨日数据/);
+  assert.doesNotMatch(payload.msg, /0 B/);
+  assert.deepEqual(JSON.parse(saved[0].value).daily, {
+    time: Math.floor(now / 1000),
+    rx_bytes: 5_000,
+    tx_bytes: 8_000
+  });
 });

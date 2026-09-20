@@ -1575,14 +1575,18 @@ export function updateTrafficSnapshots(value, currentRx, currentTx, timestamp, t
   const rx = Math.max(0, Number(currentRx) || 0);
   const tx = Math.max(0, Number(currentTx) || 0);
   const usage = {};
+  const missing = [];
   let changed = false;
 
   for (const type of types) {
     const previous = snapshots[type];
     if (!previous || !isPreviousTrafficPeriod(previous, timestamp, type, timezone)) {
-      // First report (or a gap after missed periods): reset the baseline to
-      // the current cumulative counter, but still emit a useful zero report.
+      // No usable baseline (first report of this server, a wiped snapshot, or a
+      // gap after missed periods): reset the baseline to the current cumulative
+      // counter. The delta stays zero, but the period is flagged so the report
+      // can say "no data" instead of a misleading 0 B.
       usage[type] = { rx_bytes: 0, tx_bytes: 0 };
+      missing.push(type);
     } else {
       usage[type] = {
         rx_bytes: calculateTrafficDelta(rx, previous.rx_bytes),
@@ -1592,7 +1596,7 @@ export function updateTrafficSnapshots(value, currentRx, currentTx, timestamp, t
     snapshots[type] = { time: nowSeconds, rx_bytes: rx, tx_bytes: tx };
     changed = true;
   }
-  return { snapshots, usage, changed };
+  return { snapshots, usage, changed, missing };
 }
 
 export async function initializeMissingTrafficSnapshots(
@@ -1810,6 +1814,19 @@ export function buildTrafficReportPayloads(servers, rows, label) {
   return payloads;
 }
 
+export function collectMissingTrafficBaselineTypes(servers, types) {
+  const requestedTypes = Array.isArray(types) ? types : [];
+  const missingByServerId = new Map();
+
+  for (const server of servers || []) {
+    const snapshots = normalizeTrafficSnapshots(server?.traffic_snapshots);
+    const missingTypes = requestedTypes.filter(type => !snapshots[type]);
+    if (missingTypes.length > 0) missingByServerId.set(server.id, new Set(missingTypes));
+  }
+
+  return missingByServerId;
+}
+
 export async function checkTrafficReports(db, options = {}) {
   const snapshot = options.snapshot;
   const settings = snapshot?.settings || await loadSiteSettings(db);
@@ -1864,6 +1881,10 @@ export async function checkTrafficReports(db, options = {}) {
     const latestMetrics = snapshot?.latestMetrics instanceof Map
       ? snapshot.latestMetrics
       : await getLatestMetricsForAllServers(db, servers);
+    // Seeding below replaces "no baseline" with the current counters, so the
+    // periods without a baseline must be captured first: they cannot be
+    // measured and must not be reported as 0 B.
+    const blankBaselineTypes = collectMissingTrafficBaselineTypes(servers, claimedReportTypes);
     // Missing baselines are filled from the already loaded latest metrics.
     // Keep this in memory because the report roll below persists the same
     // snapshot once, avoiding a second D1 write for the same server.
@@ -1892,10 +1913,12 @@ export async function checkTrafficReports(db, options = {}) {
         claimedReportTypes,
         settings.notification_timezone
       );
+      const blankTypes = blankBaselineTypes.get(server.id);
       for (const type of claimedReportTypes) {
-        usageRows[type].push(result.usage[type]
-          ? { server_id: server.id, ...result.usage[type] }
-          : { server_id: server.id, missing: true });
+        const missingBaseline = Boolean(blankTypes?.has(type)) || result.missing.includes(type);
+        usageRows[type].push(missingBaseline
+          ? { server_id: server.id, missing: true }
+          : { server_id: server.id, ...result.usage[type] });
       }
       if (result.changed) {
         pendingSnapshots.push({ id: server.id, snapshots: result.snapshots });
