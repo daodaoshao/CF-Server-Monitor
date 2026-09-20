@@ -6,7 +6,7 @@ import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
 import { AppError, createSuccessResponse, createBadRequestResponse, createUnauthorizedResponse, createErrorResponse } from '../utils/errors.js';
 import { addServerColumns } from '../database/updateDatabase.js';
-import { clearResourceAlertState, initializeMissingTrafficSnapshots, sendNotification } from '../services/notification.js';
+import { clearResourceAlertState, rebuildTrafficSnapshotsFromHistory, sendNotification } from '../services/notification.js';
 import { getNextServerHistoryPartitionId, HISTORY_MAX_PARTITION_ID } from '../database/indexOptimization.js';
 import { isValidTrafficCorrection, normalizeConnectionMode, normalizePingMode, normalizeWssReportInterval, validateAgentConfigInput, validatePingNode, validateNetworkInterfaces } from '../utils/agentConfig.js';
 import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../utils/agentConfigNotify.js';
@@ -603,7 +603,6 @@ async function handleSaveThemeOptionsAction({ env, sys, data }) {
 async function handleListAction({ env }) {
   const servers = await getAllServers(env.DB);
   const latestMetricsMap = await getLatestMetricsForAllServers(env.DB);
-  await initializeMissingTrafficSnapshots(env.DB, servers, latestMetricsMap);
 
   const now = Date.now();
   const ONLINE_THRESHOLD = 300000;
@@ -662,6 +661,33 @@ async function handleListAction({ env }) {
     success: true,
     servers: serversWithStatus,
     stats
+  });
+}
+
+async function handleRebuildTrafficBaselinesAction({ env, sys, data }) {
+  const servers = await getAllServers(env.DB);
+  const latestMetricsMap = await getLatestMetricsForAllServers(env.DB, servers);
+  const settings = {
+    notification_timezone: normalizeNotificationTimezone(
+      data.notification_timezone ?? sys?.notification_timezone
+    ),
+    expire_notification_time: normalizeExpireNotificationTime(
+      data.expire_notification_time ?? sys?.expire_notification_time
+    )
+  };
+  const stats = await rebuildTrafficSnapshotsFromHistory(
+    env.DB,
+    servers,
+    latestMetricsMap,
+    Date.now(),
+    settings
+  );
+  clearServersListCache();
+
+  return createSuccessResponse({
+    success: true,
+    ...stats,
+    message: 'trafficBaselinesRebuilt'
   });
 }
 
@@ -741,6 +767,7 @@ const AUTHENTICATED_ADMIN_ACTION_HANDLERS = {
   start_theme_preview: handleStartThemePreviewAction,
   save_theme_options: handleSaveThemeOptionsAction,
   list: handleListAction,
+  rebuild_traffic_baselines: handleRebuildTrafficBaselinesAction,
   d1_usage: handleD1UsageAction,
   send_test_notification: handleSendTestNotificationAction
 };

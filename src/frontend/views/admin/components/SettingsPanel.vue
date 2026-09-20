@@ -298,10 +298,24 @@
                 :text="`⚠️ ${trans.trafficReportRestartWarning || 'Traffic uses network-interface counters. A server or Agent restart may reset them and make the current report period inaccurate.'}`"
               />
             </label>
-            <select v-model="settings.traffic_report_enabled" class="form-select">
-              <option :value="false">{{ trans.disabled || 'Disabled' }}</option>
-              <option :value="true">{{ trans.enabled || 'Enabled' }}</option>
-            </select>
+            <div class="flex" style="gap: 8px; align-items: center;">
+              <select v-model="settings.traffic_report_enabled" class="form-select flex-1">
+                <option :value="false">{{ trans.disabled || 'Disabled' }}</option>
+                <option :value="true">{{ trans.enabled || 'Enabled' }}</option>
+              </select>
+              <button
+                type="button"
+                class="btn"
+                style="white-space: nowrap;"
+                :disabled="trafficBaselineRebuilding"
+                @click="$emit('rebuild-traffic-baselines')"
+              >
+                {{ trafficBaselineRebuilding ? '⏳' : '↻' }}
+                {{ trafficBaselineRebuilding
+                  ? (trans.rebuildingTrafficBaselines || 'Initializing...')
+                  : (trans.rebuildTrafficBaselines || 'Initialize') }}
+              </button>
+            </div>
           </div>
 
           <div class="form-group flex-1">
@@ -806,6 +820,7 @@ const props = defineProps({
   changeAdminPassword: { type: Boolean, default: false },
   testNotificationLoading: { type: Boolean, default: false },
   d1UsageLoading: { type: Boolean, default: false },
+  trafficBaselineRebuilding: { type: Boolean, default: false },
   githubBindingLoading: { type: Boolean, default: false }
 })
 
@@ -842,7 +857,7 @@ const canBindGithub = computed(() => Boolean(
 const emit = defineEmits([
   'toggle-password', 'toggle-admin-password-change',
   'save-settings', 'upload-bg', 'upload-bg-mobile', 'upload-favicon',
-  'send-test-notification', 'query-d1-usage', 'bind-github-account',
+  'send-test-notification', 'query-d1-usage', 'rebuild-traffic-baselines', 'bind-github-account',
   'alert-message'
 ])
 

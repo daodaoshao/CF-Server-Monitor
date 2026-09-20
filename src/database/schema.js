@@ -788,3 +788,46 @@ export async function getLatestMetricsForAllServers(db, providedServers = null) 
     return cacheInfo.cache || new Map();
   }
 }
+
+export async function createTrafficBaselineLookupContext(db, earliestTimestamp, now = Date.now()) {
+  const nowDate = new Date(now);
+  const day = nowDate.getUTCDay();
+  const tableBoundary = Date.UTC(
+    nowDate.getUTCFullYear(),
+    nowDate.getUTCMonth(),
+    nowDate.getUTCDate() - day
+  );
+  const needsOldTable = Number(earliestTimestamp) < tableBoundary;
+  const oldTableExists = needsOldTable && !!await db.prepare(
+    `SELECT name FROM sqlite_master WHERE type='table' AND name='metrics_history_old'`
+  ).first();
+  return { now: Number(now), tableBoundary, oldTableExists };
+}
+
+export async function getTrafficBaselineMetric(db, server, startTimestamp, context) {
+  const serverId = String(server?.id || '').trim();
+  const start = Number(startTimestamp);
+  const end = Number(context?.now || Date.now());
+  if (!serverId || !Number.isFinite(start) || start <= 0 || start >= end) return null;
+
+  const queryTable = async tableName => {
+    const historyInfo = await getServerHistoryInfo(db, serverId, server);
+    if (!historyInfo.partitionId) return null;
+    const range = getHistoryIdRange(historyInfo.partitionId, start, end);
+    return db.prepare(`
+      SELECT timestamp, net_rx, net_tx
+      FROM ${tableName}
+      WHERE id >= ? AND id <= ?
+      ORDER BY id ASC
+      LIMIT 1
+    `).bind(range.startId, range.endId).first();
+  };
+
+  if (context?.oldTableExists && start < Number(context.tableBoundary)) {
+    const oldMetric = await queryTable('metrics_history_old');
+    if (oldMetric) return normalizeProbeMetricRow(oldMetric);
+  }
+
+  const currentMetric = await queryTable('metrics_history');
+  return currentMetric ? normalizeProbeMetricRow(currentMetric) : null;
+}

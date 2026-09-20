@@ -148,6 +148,7 @@
           :change-admin-password="changeAdminPassword"
           :test-notification-loading="testNotificationLoading"
           :d1-usage-loading="d1UsageLoading"
+          :traffic-baseline-rebuilding="trafficBaselineRebuilding"
           :github-binding-loading="githubBindingLoading"
           @toggle-password="togglePassword"
           @toggle-admin-password-change="toggleAdminPasswordChange"
@@ -157,6 +158,7 @@
           @upload-favicon="uploadFavicon"
           @send-test-notification="sendTestNotification"
           @query-d1-usage="queryD1Usage"
+          @rebuild-traffic-baselines="rebuildTrafficBaselines"
           @bind-github-account="bindGithubAccount"
           @alert-message="alertMessage = $event"
         />
@@ -1107,6 +1109,7 @@ const dbLoading = ref(false)
 const dbResult = ref(null)
 const d1UsageLoading = ref(false)
 const d1UsageResult = ref(null)
+const trafficBaselineRebuilding = ref(false)
 const githubBindingLoading = ref(false)
 const validationError = ref(null)
 const alertMessage = ref(null)
@@ -2545,6 +2548,35 @@ const queryD1Usage = async () => {
     alertMessage.value = getMessage(e.message) || e.message || trans.value.operationFailed
   } finally {
     d1UsageLoading.value = false
+  }
+}
+
+const rebuildTrafficBaselines = async () => {
+  if (trafficBaselineRebuilding.value) return
+
+  trafficBaselineRebuilding.value = true
+  try {
+    const result = await adminApiForSite({
+      action: 'rebuild_traffic_baselines',
+      notification_timezone: normalizeNotificationTimezoneSetting(settings.value.notification_timezone),
+      expire_notification_time: normalizeExpireNotificationTimeSetting(settings.value.expire_notification_time)
+    })
+    if (result.error) {
+      alertMessage.value = getMessage(result.error) || result.error || trans.value.rebuildTrafficBaselinesFailed
+      return
+    }
+
+    const stats = result.data || {}
+    const resultTemplate = trans.value.rebuildTrafficBaselinesSuccess ||
+      'Traffic baselines initialized: {updated} succeeded, {failed} failed, {skipped} skipped.'
+    alertMessage.value = resultTemplate
+      .replace('{updated}', String(Number(stats.updated) || 0))
+      .replace('{failed}', String(Number(stats.failed) || 0))
+      .replace('{skipped}', String(Number(stats.skipped) || 0))
+  } catch (e) {
+    alertMessage.value = `${trans.value.rebuildTrafficBaselinesFailed || 'Failed to initialize traffic baselines'}: ${e.message}`
+  } finally {
+    trafficBaselineRebuilding.value = false
   }
 }
 

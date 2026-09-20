@@ -6,9 +6,11 @@ import {
   buildTrafficReportPayloads,
   calculateTrafficDelta,
   getDueTrafficReportTypes,
+  getTrafficBaselineTargets,
   getTrafficPeriodKeys,
   initializeMissingTrafficSnapshots,
   normalizeTrafficSnapshots,
+  rebuildTrafficSnapshotsFromHistory,
   splitNotificationPayload,
   updateTrafficSnapshots
 } from '../src/services/notification.js';
@@ -36,10 +38,11 @@ test('traffic snapshots initialize the three lightweight JSON baselines', () => 
   }
 });
 
-test('admin list initialization fills only missing traffic baselines', async () => {
+test('traffic initialization fills only missing baselines', async () => {
   let saved;
   const db = {
-    prepare() {
+    prepare(sql) {
+      assert.doesNotMatch(sql, /SELECT|metrics_history/);
       return {
         bind(value, id) {
           saved = { value, id };
@@ -50,20 +53,208 @@ test('admin list initialization fills only missing traffic baselines', async () 
   };
   const servers = [{
     id: server.id,
+    history_partition_id: 1,
     traffic_snapshots: JSON.stringify({
       daily: { time: 1, rx_bytes: 100, tx_bytes: 200 }
     })
   }];
   const metrics = new Map([[server.id, { net_rx: 1_000, net_tx: 2_000 }]]);
+  const now = Date.UTC(2026, 8, 20, 7);
 
-  const count = await initializeMissingTrafficSnapshots(db, servers, metrics, 10_000);
+  const count = await initializeMissingTrafficSnapshots(db, servers, metrics, now);
   const snapshots = JSON.parse(saved.value);
 
   assert.equal(count, 1);
   assert.equal(saved.id, server.id);
   assert.deepEqual(snapshots.daily, { time: 1, rx_bytes: 100, tx_bytes: 200 });
-  assert.deepEqual(snapshots.weekly, { time: 10, rx_bytes: 1_000, tx_bytes: 2_000 });
-  assert.deepEqual(snapshots.monthly, { time: 10, rx_bytes: 1_000, tx_bytes: 2_000 });
+  assert.deepEqual(snapshots.weekly, { time: now / 1000, rx_bytes: 1_000, tx_bytes: 2_000 });
+  assert.deepEqual(snapshots.monthly, { time: now / 1000, rx_bytes: 1_000, tx_bytes: 2_000 });
+});
+
+test('cron can initialize a missing baseline in memory without an extra D1 write', async () => {
+  const now = Date.UTC(2026, 8, 20, 7);
+  const servers = [{ id: server.id, traffic_snapshots: '{}' }];
+  const metrics = new Map([[server.id, { net_rx: 1_000, net_tx: 2_000 }]]);
+  const db = { prepare: () => assert.fail('cron initialization should not write') };
+
+  const count = await initializeMissingTrafficSnapshots(
+    db,
+    servers,
+    metrics,
+    now,
+    ['daily'],
+    false
+  );
+
+  assert.equal(count, 1);
+  assert.deepEqual(servers[0].traffic_snapshots.daily, {
+    time: now / 1000,
+    rx_bytes: 1_000,
+    tx_bytes: 2_000
+  });
+});
+
+test('manual traffic rebuild overwrites all baselines from retained history', async () => {
+  let saved;
+  let saves = 0;
+  const queries = [];
+  const now = Date.UTC(2026, 8, 20, 2);
+  const historicalTimestamp = Date.UTC(2026, 8, 19, 2, 1);
+  const db = {
+    prepare(sql) {
+      if (/sqlite_master/.test(sql)) {
+        return { first: async () => ({ name: 'metrics_history_old' }) };
+      }
+      if (/SELECT timestamp, net_rx, net_tx/.test(sql)) {
+        queries.push(sql);
+        return {
+          bind() {
+            return {
+              first: async () => /metrics_history_old/.test(sql)
+                ? { timestamp: historicalTimestamp, net_rx: 400, net_tx: 700 }
+                : { timestamp: now, net_rx: 800, net_tx: 900 }
+            };
+          }
+        };
+      }
+      return {
+        bind(value, id) {
+          saved = { value, id };
+          return { run: async () => {
+            saves += 1;
+            return { success: true };
+          } };
+        }
+      };
+    }
+  };
+  const servers = [{
+    id: server.id,
+    history_partition_id: 1,
+    traffic_snapshots: JSON.stringify({
+      daily: { time: 1, rx_bytes: 1, tx_bytes: 2 },
+      weekly: { time: 1, rx_bytes: 1, tx_bytes: 2 },
+      monthly: { time: 1, rx_bytes: 1, tx_bytes: 2 }
+    })
+  }];
+  const metrics = new Map([[server.id, { net_rx: 1_000, net_tx: 2_000 }]]);
+
+  const stats = await rebuildTrafficSnapshotsFromHistory(db, servers, metrics, now, {
+    notification_timezone: timezone,
+    expire_notification_time: '10'
+  });
+
+  const snapshots = JSON.parse(saved.value);
+  assert.deepEqual(snapshots.daily, {
+    time: now / 1000,
+    rx_bytes: 1_000,
+    tx_bytes: 2_000
+  });
+  for (const type of ['weekly', 'monthly']) {
+    assert.deepEqual(snapshots[type], {
+      time: historicalTimestamp / 1000,
+      rx_bytes: 400,
+      tx_bytes: 700
+    });
+  }
+  assert.deepEqual(stats, {
+    updated: 1,
+    historyMatched: 2,
+    fallbackToLatest: 1,
+    skipped: 0,
+    failed: 0
+  });
+  assert.equal(saves, 1);
+  assert.equal(queries.length, 2);
+  assert.equal(queries.filter(sql => /FROM metrics_history_old/.test(sql)).length, 2);
+  queries.forEach(sql => assert.doesNotMatch(sql, /SELECT \*/));
+});
+
+test('manual traffic rebuild falls back to latest counters when history is unavailable', async () => {
+  let saved;
+  const now = Date.UTC(2026, 8, 20, 7);
+  const db = {
+    prepare(sql) {
+      if (/sqlite_master/.test(sql)) return { first: async () => null };
+      if (/SELECT timestamp, net_rx, net_tx/.test(sql)) {
+        return { bind: () => ({ first: async () => null }) };
+      }
+      return {
+        bind(value, id) {
+          saved = { value, id };
+          return { run: async () => ({ success: true }) };
+        }
+      };
+    }
+  };
+  const servers = [{ id: server.id, history_partition_id: 1, traffic_snapshots: '{}' }];
+  const metrics = new Map([[server.id, { net_rx: 1_000, net_tx: 2_000 }]]);
+
+  const stats = await rebuildTrafficSnapshotsFromHistory(db, servers, metrics, now, {
+    notification_timezone: timezone,
+    expire_notification_time: '10'
+  });
+
+  const snapshots = JSON.parse(saved.value);
+  for (const type of ['daily', 'weekly', 'monthly']) {
+    assert.deepEqual(snapshots[type], {
+      time: now / 1000,
+      rx_bytes: 1_000,
+      tx_bytes: 2_000
+    });
+  }
+  assert.equal(stats.updated, 1);
+  assert.equal(stats.historyMatched, 0);
+  assert.equal(stats.fallbackToLatest, 3);
+});
+
+test('traffic baseline targets honor timezone and notification hour', () => {
+  const targets = getTrafficBaselineTargets(
+    Date.UTC(2026, 8, 20, 7),
+    'Asia/Shanghai',
+    '10'
+  );
+
+  assert.equal(new Date(targets.daily).toISOString(), '2026-09-20T02:00:00.000Z');
+  assert.equal(new Date(targets.weekly).toISOString(), '2026-09-14T02:00:00.000Z');
+  assert.equal(new Date(targets.monthly).toISOString(), '2026-09-01T02:00:00.000Z');
+});
+
+test('traffic baseline targets keep the previous period before its scheduled boundary', () => {
+  const targets = getTrafficBaselineTargets(
+    Date.UTC(2026, 8, 21, 1, 59),
+    'Asia/Shanghai',
+    '10'
+  );
+
+  assert.equal(new Date(targets.daily).toISOString(), '2026-09-20T02:00:00.000Z');
+  assert.equal(new Date(targets.weekly).toISOString(), '2026-09-14T02:00:00.000Z');
+  assert.equal(new Date(targets.monthly).toISOString(), '2026-09-01T02:00:00.000Z');
+
+  const nextReport = Date.UTC(2026, 8, 21, 2);
+  const result = updateTrafficSnapshots({
+    daily: { time: targets.daily / 1000, rx_bytes: 100, tx_bytes: 200 },
+    weekly: { time: targets.weekly / 1000, rx_bytes: 100, tx_bytes: 200 }
+  }, 300, 500, nextReport, ['daily', 'weekly'], 'Asia/Shanghai');
+
+  assert.deepEqual(result.usage.daily, { rx_bytes: 200, tx_bytes: 300 });
+  assert.deepEqual(result.usage.weekly, { rx_bytes: 200, tx_bytes: 300 });
+});
+
+test('monthly traffic baseline switches at the configured hour on the first day', () => {
+  const beforeBoundary = getTrafficBaselineTargets(
+    Date.UTC(2026, 9, 1, 1, 59),
+    'Asia/Shanghai',
+    '10'
+  );
+  const atBoundary = getTrafficBaselineTargets(
+    Date.UTC(2026, 9, 1, 2),
+    'Asia/Shanghai',
+    '10'
+  );
+
+  assert.equal(new Date(beforeBoundary.monthly).toISOString(), '2026-09-01T02:00:00.000Z');
+  assert.equal(new Date(atBoundary.monthly).toISOString(), '2026-10-01T02:00:00.000Z');
 });
 
 test('traffic snapshots calculate usage and roll only crossed period boundaries', () => {

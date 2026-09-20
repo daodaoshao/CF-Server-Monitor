@@ -1,4 +1,8 @@
-import { getLatestMetricsForAllServers } from '../database/schema.js';
+import {
+  createTrafficBaselineLookupContext,
+  getLatestMetricsForAllServers,
+  getTrafficBaselineMetric
+} from '../database/schema.js';
 import { updateDatabase } from '../database/updateDatabase.js';
 import { clearServersListCache, getAllServers } from '../utils/cache.js';
 import {
@@ -493,6 +497,84 @@ async function fetchWithRetry(url, options) {
   const response = await fetch(url, options);
   if (response.ok) return response;
   throw new Error(`HTTP ${response.status}`);
+}
+
+function zonedDateTimeToTimestamp(parts, timezone) {
+  const desired = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, 0, 0);
+  let guess = desired;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const actual = getZonedDateParts(guess, timezone);
+    if (!actual) break;
+    const actualAsUtc = Date.UTC(
+      Number(actual.year),
+      Number(actual.month) - 1,
+      Number(actual.day),
+      Number(actual.hour),
+      0,
+      0
+    );
+    const difference = desired - actualAsUtc;
+    if (difference === 0) return guess;
+    guess += difference;
+  }
+  return guess;
+}
+
+function trafficTargetFromDateSerial(serial, hour, timezone) {
+  const date = new Date(serial * DAY_MS);
+  return zonedDateTimeToTimestamp({
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour
+  }, timezone);
+}
+
+export function getTrafficBaselineTargets(timestamp, timezone, notificationHour) {
+  const timeZone = normalizeNotificationTimezone(timezone);
+  const hour = Number(normalizeExpireNotificationTime(notificationHour));
+  const serial = getZonedDateSerial(timestamp, timeZone);
+  const parts = getZonedDateParts(timestamp, timeZone);
+  if (!Number.isFinite(serial) || !parts) return null;
+
+  const weekday = ((serial + 4) % 7 + 7) % 7;
+  const mondayOffset = (weekday + 6) % 7;
+  const todayBoundary = trafficTargetFromDateSerial(serial, hour, timeZone);
+  const dailySerial = timestamp >= todayBoundary ? serial : serial - 1;
+
+  let weeklySerial = serial - mondayOffset;
+  let weeklyBoundary = trafficTargetFromDateSerial(weeklySerial, hour, timeZone);
+  if (timestamp < weeklyBoundary) {
+    weeklySerial -= 7;
+    weeklyBoundary = trafficTargetFromDateSerial(weeklySerial, hour, timeZone);
+  }
+
+  let monthlyBoundary = zonedDateTimeToTimestamp({
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: 1,
+    hour
+  }, timeZone);
+  if (timestamp < monthlyBoundary) {
+    let previousMonthYear = Number(parts.year);
+    let previousMonth = Number(parts.month) - 1;
+    if (previousMonth === 0) {
+      previousMonth = 12;
+      previousMonthYear -= 1;
+    }
+    monthlyBoundary = zonedDateTimeToTimestamp({
+      year: previousMonthYear,
+      month: previousMonth,
+      day: 1,
+      hour
+    }, timeZone);
+  }
+
+  return {
+    daily: trafficTargetFromDateSerial(dailySerial, hour, timeZone),
+    weekly: weeklyBoundary,
+    monthly: monthlyBoundary
+  };
 }
 
 function stableNotificationKey(value) {
@@ -1521,7 +1603,19 @@ export function updateTrafficSnapshots(value, currentRx, currentTx, timestamp, t
   return { snapshots, usage, changed };
 }
 
-export async function initializeMissingTrafficSnapshots(db, servers, latestMetricsMap, timestamp = Date.now()) {
+export async function initializeMissingTrafficSnapshots(
+  db,
+  servers,
+  latestMetricsMap,
+  timestamp = Date.now(),
+  requestedTypes = ['daily', 'weekly', 'monthly'],
+  persist = true
+) {
+  const types = Array.from(new Set(
+    (Array.isArray(requestedTypes) ? requestedTypes : [])
+      .filter(type => ['daily', 'weekly', 'monthly'].includes(type))
+  ));
+  if (types.length === 0) return 0;
   const nowSeconds = Math.floor(timestamp / 1000);
   let initialized = 0;
 
@@ -1531,7 +1625,7 @@ export async function initializeMissingTrafficSnapshots(db, servers, latestMetri
 
     const snapshots = normalizeTrafficSnapshots(server.traffic_snapshots);
     let changed = false;
-    for (const type of ['daily', 'weekly', 'monthly']) {
+    for (const type of types) {
       if (snapshots[type]) continue;
       snapshots[type] = {
         time: nowSeconds,
@@ -1542,12 +1636,104 @@ export async function initializeMissingTrafficSnapshots(db, servers, latestMetri
     }
     if (!changed) continue;
 
-    await saveTrafficSnapshots(db, snapshots, server.id);
+    if (persist) await saveTrafficSnapshots(db, snapshots, server.id);
     server.traffic_snapshots = snapshots;
     initialized += 1;
   }
 
   return initialized;
+}
+
+const TRAFFIC_BASELINE_REBUILD_CONCURRENCY = 10;
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  };
+
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
+export async function rebuildTrafficSnapshotsFromHistory(
+  db,
+  servers,
+  latestMetricsMap,
+  timestamp = Date.now(),
+  settings = {}
+) {
+  const targets = getTrafficBaselineTargets(
+    timestamp,
+    settings.notification_timezone,
+    settings.expire_notification_time
+  );
+  if (!targets) throw new Error('Invalid traffic baseline target time');
+
+  const lookupContext = await createTrafficBaselineLookupContext(
+    db,
+    Math.min(...Object.values(targets)),
+    timestamp
+  );
+  const types = ['daily', 'weekly', 'monthly'];
+  const stats = {
+    updated: 0,
+    historyMatched: 0,
+    fallbackToLatest: 0,
+    skipped: 0,
+    failed: 0
+  };
+
+  await mapWithConcurrency(
+    Array.isArray(servers) ? servers : [],
+    TRAFFIC_BASELINE_REBUILD_CONCURRENCY,
+    async server => {
+      const latest = latestMetricsMap?.get(server.id);
+      try {
+        const baselines = await Promise.all(types.map(type =>
+          getTrafficBaselineMetric(db, server, targets[type], lookupContext)
+        ));
+        const sources = baselines.map(historical => historical || latest);
+        if (sources.some(source => !source)) {
+          stats.skipped += 1;
+          return;
+        }
+        const snapshots = {};
+
+        for (let index = 0; index < types.length; index += 1) {
+          const type = types[index];
+          const historical = baselines[index];
+          const source = sources[index];
+          const sourceTimestamp = Number(historical?.timestamp);
+          snapshots[type] = {
+            time: Number.isFinite(sourceTimestamp) && sourceTimestamp > 0
+              ? Math.floor(sourceTimestamp / 1000)
+              : Math.floor(timestamp / 1000),
+            rx_bytes: Math.max(0, Number(source.net_rx) || 0),
+            tx_bytes: Math.max(0, Number(source.net_tx) || 0)
+          };
+          if (historical) stats.historyMatched += 1;
+          else stats.fallbackToLatest += 1;
+        }
+
+        await saveTrafficSnapshots(db, snapshots, server.id);
+        server.traffic_snapshots = snapshots;
+        stats.updated += 1;
+      } catch (error) {
+        stats.failed += 1;
+        console.error(`[TrafficReport] Failed to rebuild baselines for server ${server.id}:`, error);
+      }
+    }
+  );
+
+  return stats;
 }
 
 export function buildTrafficReportContent(servers, rows, label) {
@@ -1683,12 +1869,23 @@ export async function checkTrafficReports(db, options = {}) {
     // This avoids querying every server and its latest metrics on retries
     // after this period has already been claimed.
     const servers = snapshot?.servers || await getAllServers(db);
-    for (const server of servers) {
-      server.traffic_snapshots = normalizeTrafficSnapshots(server.traffic_snapshots);
-    }
     const latestMetrics = snapshot?.latestMetrics instanceof Map
       ? snapshot.latestMetrics
       : await getLatestMetricsForAllServers(db, servers);
+    // Missing baselines are filled from the already loaded latest metrics.
+    // Keep this in memory because the report roll below persists the same
+    // snapshot once, avoiding a second D1 write for the same server.
+    await initializeMissingTrafficSnapshots(
+      db,
+      servers,
+      latestMetrics,
+      now,
+      claimedReportTypes,
+      false
+    );
+    for (const server of servers) {
+      server.traffic_snapshots = normalizeTrafficSnapshots(server.traffic_snapshots);
+    }
     const usageRows = { daily: [], weekly: [], monthly: [] };
     const pendingSnapshots = [];
 
