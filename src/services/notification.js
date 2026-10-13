@@ -1314,8 +1314,8 @@ export async function checkExpiringServers(db, options = {}) {
       if (!s.expire_date) continue;
 
       const billingCycle = normalizeBillingCycle(detectBillingCycle(s.price) || s.billing_cycle);
-      // 续费时机 = 到期日 - min(提醒天数, 5)，最长提前 5 天
-      const renewal = renewExpireDateIfNeeded(s.expire_date, billingCycle, s.auto_renewal, now, Math.min(reminderDays, 5));
+      // 本站改动：到期日过后（第二天）才自动续期，到期前照常发到期提醒
+      const renewal = renewExpireDateIfNeeded(s.expire_date, billingCycle, s.auto_renewal, now, -1);
       if (renewal.renewed) {
         await db.prepare(
           'UPDATE servers SET expire_date = ?, billing_cycle = ? WHERE id = ?'
@@ -1325,9 +1325,6 @@ export async function checkExpiringServers(db, options = {}) {
         renewedServers.push({ name: s.name, expire_date: renewal.expire_date });
         debug(`[Cron] 服务器 ${s.name} 已自动续费，到期日期更新为 ${s.expire_date}`);
       }
-
-      // 勾选自动续费的节点只走「续费成功」提醒，不计入到期提醒
-      if (isEnabledFlag(s.auto_renewal)) continue;
 
       if (!shouldNotify) continue;
 
